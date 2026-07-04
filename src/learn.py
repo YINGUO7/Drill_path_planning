@@ -13,8 +13,8 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList, Check
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 
-from Env2 import MillingEnvNurbs
-from NN2 import MillingNurbsFeatureExtractor
+from env import MillingEnvNurbs
+from nn import MillingNurbsFeatureExtractor
 
 
 def select_training_device():
