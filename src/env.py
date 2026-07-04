@@ -37,7 +37,7 @@ class MillingEnvNurbs(gym.Env):
     def __init__(self, wp_size_m=210e-3, pocket_side_m=190e-3, corner_radius_m=10e-3,
                  tool_dia_m=16e-3, v_max=0.10, acc_max=0.72, jerk_max=1.44,
                  resolution_m=0.5e-3, stepover_ratio=0.99, start_radius_ratio=0.90,
-                 coverage_target=0.9998, max_internal_turns=12, render_mode="plot",
+                 coverage_target=0.9900, max_internal_turns=12, render_mode="plot",
                  curve_sample_count=900, generation_points_per_turn=24,
                  curve_sample_spacing_m=0.5e-3, generation_time_window_points=240,
                  observation_grid_size=64,
