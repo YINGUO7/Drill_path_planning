@@ -12,9 +12,9 @@ from scipy.spatial import cKDTree
 from scipy.signal import find_peaks
 
 
-rcParams["font.sans-serif"] = ["SimSun", "Microsoft YaHei", "Arial"]
-rcParams["font.serif"] = ["Times New Roman"]
-rcParams["axes.unicode_minus"] = False
+# rcParams["font.sans-serif"] = ["SimSun", "Microsoft YaHei", "Arial"]
+# rcParams["font.serif"] = ["Times New Roman"]
+# rcParams["axes.unicode_minus"] = False
 
 
 class MillingEnvNurbs(gym.Env):
@@ -50,7 +50,7 @@ class MillingEnvNurbs(gym.Env):
                  radial_gap_violation_penalty=None,
                  local_time_planner="fast", local_fast_jerk_factor=0.8,
                  full_time_reward_weight=50.0, full_time_reference=120.0,
-                 full_time_reward_floor=-300.0,
+                 full_time_reward_floor=-60.0,
                  profile_step=False, profile_interval=20):
         """初始化环境对象。
 
