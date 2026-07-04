@@ -13,8 +13,8 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList, Check
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 
-from env import MillingEnvNurbs
-from nn import MillingNurbsFeatureExtractor
+from Env2 import MillingEnvNurbs
+from NN2 import MillingNurbsFeatureExtractor
 
 
 def select_training_device():
@@ -23,7 +23,7 @@ def select_training_device():
     默认使用CPU，避免Windows下CUDA/PyTorch底层库直接崩溃。
     如需启用GPU，在终端中设置环境变量：SAC_DEVICE=cuda。
     """
-    requested = os.environ.get("SAC_DEVICE", "cpu").strip().lower()
+    requested = os.environ.get("SAC_DEVICE", "cuda").strip().lower()
     if requested == "cuda":
         if torch.cuda.is_available():
             return "cuda"
@@ -138,11 +138,11 @@ def make_env(render_mode=None):
 
 
 if __name__ == "__main__":
-    version = 4
+    version = 5
     gamma_list = [0.99, 0.98, 0.95, 0.90]
     total_timesteps = 1_000_000
-    n_envs = 2
-    eval_every_timesteps = 2_500
+    n_envs = 50
+    eval_every_timesteps = 10_000
     device = select_training_device()
     print(f"Training device: {device}")
 

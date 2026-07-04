@@ -1,0 +1,44 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and local configuration
+*.log
+.env
+.env.*
+!.env.example
+
+# Reinforcement-learning experiment artifacts
+sac_milling_nurbs_tensorboard_*/
+trained_SAC_milling_nurbs_*/
+runs/
+wandb/
+
+# Model weights and exported models
+*.ckpt
+*.onnx
+*.pt
+*.pth
+

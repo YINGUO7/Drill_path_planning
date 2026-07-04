@@ -36,7 +36,7 @@ class MillingEnvNurbs(gym.Env):
 
     def __init__(self, wp_size_m=210e-3, pocket_side_m=190e-3, corner_radius_m=10e-3,
                  tool_dia_m=16e-3, v_max=0.10, acc_max=0.72, jerk_max=1.44,
-                 resolution_m=0.5e-3, stepover_ratio=0.80, start_radius_ratio=0.90,
+                 resolution_m=0.5e-3, stepover_ratio=0.99, start_radius_ratio=0.90,
                  coverage_target=0.9998, max_internal_turns=12, render_mode="plot",
                  curve_sample_count=900, generation_points_per_turn=24,
                  curve_sample_spacing_m=0.5e-3, generation_time_window_points=240,
@@ -44,8 +44,10 @@ class MillingEnvNurbs(gym.Env):
                  time_eval_mode="local", coverage_efficiency_weight=0.01,
                  envelope_uncovered_weight=0.005, coverage_completion_bonus=200.0, remaining_cell_penalty=0.02,
                  invalid_action_penalty=-8.0, use_local_step_sweep=True,
-                 local_sweep_tail_points=None, max_consecutive_invalid_actions=40,
+                 local_sweep_tail_points=None, max_consecutive_invalid_actions=500,
                  max_episode_actions=None,
+                 radial_gap_safety_ratio=None, radial_gap_bin_count=180,
+                 radial_gap_violation_penalty=None,
                  local_time_planner="fast", local_fast_jerk_factor=0.8,
                  full_time_reward_weight=50.0, full_time_reference=120.0,
                  full_time_reward_floor=-300.0,
@@ -81,6 +83,9 @@ class MillingEnvNurbs(gym.Env):
             local_sweep_tail_points: 局部扫掠使用的尾部路径点数量；None时使用generation_time_window_points。
             max_consecutive_invalid_actions: 连续非法动作截断阈值，避免确定性eval在同一状态死循环。
             max_episode_actions: episode总动作数上限，包含非法动作；None时自动设为有效step上限的1.5倍。
+            radial_gap_safety_ratio: 射线/极坐标bin相邻路径层最大间距系数；None时使用stepover_ratio。
+            radial_gap_bin_count: 径向gap检查的角度分桶数量。
+            radial_gap_violation_penalty: 径向gap超限时的惩罚；None时为1.5倍invalid_action_penalty。
             local_time_planner: "fast"、"strict"或"vpop"；fast用于训练step局部时间估计。
             local_fast_jerk_factor: fast局部时间估计中的jerk安全系数。
             full_time_reward_weight: episode结束时完整路径加工时间惩罚权重。
@@ -115,6 +120,12 @@ class MillingEnvNurbs(gym.Env):
         self.local_sweep_tail_points = (None if local_sweep_tail_points is None else int(local_sweep_tail_points))
         self.max_consecutive_invalid_actions = max(1, int(max_consecutive_invalid_actions))
         self.requested_max_episode_actions = None if max_episode_actions is None else int(max_episode_actions)
+        self.radial_gap_safety_ratio = float(self.stepover_ratio if radial_gap_safety_ratio is None else radial_gap_safety_ratio)
+        self.radial_gap_bin_count = int(radial_gap_bin_count)
+        self.radial_gap_violation_penalty = (
+            1.5 * self.invalid_action_penalty if radial_gap_violation_penalty is None
+            else float(radial_gap_violation_penalty)
+        )
         self.local_time_planner = str(local_time_planner).lower()
         self.local_fast_jerk_factor = float(local_fast_jerk_factor)
         self.full_time_reward_weight = float(full_time_reward_weight)
@@ -191,6 +202,10 @@ class MillingEnvNurbs(gym.Env):
             raise ValueError("generation_time_window_points至少为20。")
         if self.observation_grid_size < 16:
             raise ValueError("observation_grid_size至少为16。")
+        if self.radial_gap_safety_ratio <= 0.0:
+            raise ValueError("radial_gap_safety_ratio必须大于0。")
+        if self.radial_gap_bin_count < 24:
+            raise ValueError("radial_gap_bin_count至少为24。")
         if self.time_eval_mode not in ("local", "full"):
             raise ValueError("time_eval_mode必须为'local'或'full'。")
         if self.local_time_planner not in ("fast", "strict", "vpop"):
@@ -430,7 +445,7 @@ class MillingEnvNurbs(gym.Env):
         self._precompute_boundary_radius()
         self.max_generation_steps = int(np.ceil(1.35 * self.max_internal_turns * self.generation_points_per_turn))
         if self.requested_max_episode_actions is None:
-            self.max_episode_actions = int(np.ceil(1.5 * self.max_generation_steps))
+            self.max_episode_actions = int(np.ceil(2 * self.max_generation_steps))
         else:
             self.max_episode_actions = max(1, int(self.requested_max_episode_actions))
 
@@ -561,6 +576,59 @@ class MillingEnvNurbs(gym.Env):
         envelope_flat = self.grid_rho_flat <= envelope_rho + 1e-9
         envelope_mask = envelope_flat.reshape(self.wp_grid_points, self.wp_grid_points)
         return envelope_mask & self.inner_core_mask
+
+    def _radial_gap_constraint(self, path):
+        """检查射线/极坐标bin上的相邻路径层径向gap。
+
+        输入：
+            path: 候选完整NURBS路径采样点，单位m。
+
+        输出：
+            ok: True表示所有已形成路径层之间的径向gap不超过约束。
+            max_gap: 检测到的最大相邻径向gap，单位m。
+            limit: 允许的最大径向gap，单位m。
+            worst_theta: 最大gap所在角度，单位rad；无有效bin时为0。
+
+        说明：
+            该约束对应 d_gap(theta) <= eta * 2R。
+            它把中心固定圆作为第一层路径，再把当前候选NURBS路径采样点加入。
+            对每个角度bin内的半径排序，只检查相邻路径层之间的gap，不检查最外层到边界的gap，
+            因为外侧区域可能还没有规划到。
+        """
+        path = np.asarray(path, dtype=np.float64)
+        if len(path) < 5:
+            return True, 0.0, float(self.radial_gap_safety_ratio * 2.0 * self.tool_r), 0.0
+
+        points = np.vstack((self.seed_circle_path, path))
+        vectors = points - self.path_center
+        radius = np.linalg.norm(vectors, axis=1)
+        theta = (np.arctan2(vectors[:, 1], vectors[:, 0]) + 2.0 * np.pi) % (2.0 * np.pi)
+
+        bin_count = int(self.radial_gap_bin_count)
+        bin_width = 2.0 * np.pi / bin_count
+        bin_index = np.floor(theta / bin_width).astype(np.int64) % bin_count
+        limit = float(self.radial_gap_safety_ratio * 2.0 * self.tool_r)
+
+        max_gap = 0.0
+        worst_bin = 0
+        # NURBS采样点数量不大，按bin循环比构造稀疏结构更清楚，也足够快。
+        for idx in range(bin_count):
+            radii = radius[bin_index == idx]
+            if len(radii) < 2:
+                continue
+            radii = np.sort(radii)
+            # 合并同一层附近的密集采样点，避免同一条曲线的多个近邻点干扰层间gap。
+            keep = np.concatenate(([True], np.diff(radii) > 0.25 * self.res))
+            radii = radii[keep]
+            if len(radii) < 2:
+                continue
+            gap = float(np.max(np.diff(radii)))
+            if gap > max_gap:
+                max_gap = gap
+                worst_bin = idx
+
+        worst_theta = (worst_bin + 0.5) * bin_width
+        return max_gap <= limit, max_gap, limit, worst_theta
 
     def _time_eval_path(self, path, mode, local_window_length=None):
         """取得用于时间估计的路径片段。
@@ -1905,6 +1973,103 @@ class MillingEnvNurbs(gym.Env):
         infeasible_curve_points = int(np.count_nonzero(~self._tool_centers_are_feasible(path)))
         t_feasible = time.perf_counter()
 
+        radial_gap_ok, radial_gap_max, radial_gap_limit, radial_gap_theta = self._radial_gap_constraint(path)
+        t_radial_gap = time.perf_counter()
+        if not radial_gap_ok:
+            # 候选路径会让相邻螺旋层径向间距超过刀具允许stepover，不执行该动作。
+            self.generated_control_points.pop()
+            self.invalid_action_steps += 1
+            self.episode_invalid_actions += 1
+            invalid_truncated = self.invalid_action_steps >= self.max_consecutive_invalid_actions
+            action_count_truncated = self.episode_action_count >= self.max_episode_actions
+            self.truncated = bool(invalid_truncated or action_count_truncated)
+            if invalid_truncated:
+                reason = "too_many_invalid_actions_radial_gap"
+            elif action_count_truncated:
+                reason = "max_episode_actions"
+            else:
+                reason = "radial_gap_violation"
+
+            remaining = int(np.count_nonzero(self.inner_core_mask & (self.visited == 0)))
+            covered = int(np.count_nonzero(self.inner_core_mask & (self.visited == 2)))
+            current_length = 0.0
+            if len(self.current_path) >= 2:
+                current_length = float(np.sum(np.linalg.norm(np.diff(self.current_path, axis=0), axis=1)))
+
+            reward = self.radial_gap_violation_penalty
+            full_time = 0.0
+            full_time_reward = 0.0
+            raw_full_time_reward = 0.0
+            if self.truncated and len(self.current_path) >= 5:
+                self._refresh_full_sweep_state()
+                full_time = self.estimate_machining_time(self.current_path, mode="full", planner="strict")
+                full_time_reward, raw_full_time_reward = self._full_time_reward(full_time)
+                reward += full_time_reward
+
+            self.ep_full_time_reward_sum += full_time_reward
+            self.episode_reward += reward
+            self.ep_invalid_reward_sum += self.radial_gap_violation_penalty
+            self.last_info = {
+                "reason": reason,
+                "action_executed": False,
+                "radial_gap_violation": True,
+                "radial_gap_max": float(radial_gap_max),
+                "radial_gap_limit": float(radial_gap_limit),
+                "radial_gap_theta": float(radial_gap_theta),
+                "invalid_action_steps": self.invalid_action_steps,
+                "episode_invalid_actions": self.episode_invalid_actions,
+                "new_cells": 0,
+                "new_area_mm2": 0.0,
+                "repeat_cells": 0,
+                "repeat_area_mm2": 0.0,
+                "overcut_cells": 0,
+                "infeasible_curve_points": int(infeasible_curve_points),
+                "curve_length": current_length,
+                "local_time": 0.0,
+                "eval_time": 0.0,
+                "full_time": full_time,
+                "local_time_path_length": 0.0,
+                "local_time_planner": self.local_time_planner,
+                "coverage_efficiency": 0.0,
+                "efficiency_reward": 0.0,
+                "coverage_reward": 0.0,
+                "full_time_reward": full_time_reward,
+                "raw_full_time_reward": raw_full_time_reward,
+                "envelope_uncovered_cells": 0,
+                "envelope_uncovered_area_mm2": 0.0,
+                "envelope_coverage_ratio": 0.0,
+                "max_kappa": float(np.max(curvature)) if len(curvature) else 0.0,
+                "max_dkappa": 0.0,
+                "remaining_cells": remaining,
+                "coverage_ratio": covered / max(self.total_planning_cells, 1),
+                "coverage_reached": False,
+                "control_points": np.asarray(self.generated_control_points).copy(),
+                "attempted_control_point": new_point.copy(),
+                "action": action.copy(),
+                "dtheta": float(dtheta),
+                "dr_requested": float(dr_requested),
+                "equivalent_stepover": float(dr * 2.0 * np.pi / max(dtheta, 1e-12)),
+                "dr": float(dr),
+                "radius": float(radius_new),
+                "rho": float(rho_new),
+                "boundary_radius": float(boundary_new),
+            }
+            self._attach_episode_metrics(self.last_info, reward)
+            self._record_render_history(self.last_info, reward)
+            if self.render_mode in ("plot", "human"):
+                self.render()
+            obs = self._get_obs()
+            t_end = time.perf_counter()
+            self._record_step_profile({
+                "action": t_action - step_t0,
+                "curve": t_curve - t_action,
+                "feasible": t_feasible - t_curve,
+                "radial_gap": t_radial_gap - t_feasible,
+                "invalid_bookkeeping": t_end - t_radial_gap,
+                "total": t_end - step_t0,
+            }, invalid=True)
+            return obs, float(reward), False, self.truncated, self.last_info
+
         swept = self._step_sweep_mask(path)
         t_sweep = time.perf_counter()
         previously_cut = self.visited != 0
@@ -2045,8 +2210,14 @@ class MillingEnvNurbs(gym.Env):
             "remaining_cells": remaining,
             "coverage_ratio": covered / max(self.total_planning_cells, 1),
             "coverage_reached": coverage_reached,
+            "radial_gap_violation": False,
+            "radial_gap_max": float(radial_gap_max),
+            "radial_gap_limit": float(radial_gap_limit),
+            "radial_gap_theta": float(radial_gap_theta),
             "sweep_mode": "local" if self.use_local_step_sweep else "full",
-            "reason": "coverage_reached" if self.terminated else truncation_reason,
+            "reason": "coverage_reached" if self.terminated else (
+                truncation_reason if self.truncated else "running"
+            ),
             "action_executed": True,
             "invalid_action_steps": self.invalid_action_steps,
             "episode_invalid_actions": self.episode_invalid_actions,
@@ -2073,7 +2244,8 @@ class MillingEnvNurbs(gym.Env):
             "action": t_action - step_t0,
             "curve": t_curve - t_action,
             "feasible": t_feasible - t_curve,
-            "sweep": t_sweep - t_feasible,
+            "radial_gap": t_radial_gap - t_feasible,
+            "sweep": t_sweep - t_radial_gap,
             "mask_update": t_masks - t_sweep,
             "time_plan": t_time - t_masks,
             "envelope": t_envelope - t_time,
@@ -2419,11 +2591,13 @@ class MillingEnvNurbs(gym.Env):
         self.speed_fig.canvas.draw_idle()
         self.speed_fig.canvas.flush_events()
 
-    def render(self):
+    def render(self, force_speed_diagnostics=False):
         """刷新render窗口。
 
         输入：
-            无。
+            force_speed_diagnostics: 是否强制刷新完整路径速度/加速度/jerk诊断图。
+                默认False，仅在episode结束时绘制第二个figure；
+                测试脚本可以设为True，以便在未终止时查看当前完整路径诊断。
 
         输出：
             无返回；更新覆盖、当前完整曲线和控制点。
@@ -2482,6 +2656,8 @@ class MillingEnvNurbs(gym.Env):
             f"equiv. stepover: {self.last_info.get('equivalent_stepover', 0.0) * 1000.0:.3f} mm\n"
             f"local path: {self.last_info.get('local_time_path_length', 0.0) * 1000.0:.2f} mm\n"
             f"local time: {self.last_info.get('local_time', 0.0):.4f} s\n"
+            f"radial gap: {self.last_info.get('radial_gap_max', 0.0) * 1000.0:.2f}/"
+            f"{self.last_info.get('radial_gap_limit', self.radial_gap_safety_ratio * 2.0 * self.tool_r) * 1000.0:.2f} mm\n"
             f"eval time ({self.last_info.get('time_eval_mode', self.time_eval_mode)}): "
             f"{self.last_info.get('eval_time', 0.0):.4f} s\n"
             f"env. uncut: {self.last_info.get('envelope_uncovered_area_mm2', 0.0):.2f} mm2\n"
@@ -2510,9 +2686,10 @@ class MillingEnvNurbs(gym.Env):
         ax_map.relim()
         ax_map.autoscale_view(scalex=False, scaley=True)
 
-        # 完整路径速度/加速度/jerk诊断只在路径规划结束后绘制。
-        # 训练或逐步调试时不反复更新第二个figure，避免不必要的完整速度规划开销。
-        if self.terminated or self.truncated:
+        # 完整路径速度/加速度/jerk诊断默认只在路径规划结束后绘制。
+        # 测试入口可通过force_speed_diagnostics=True查看未结束episode的当前完整路径诊断，
+        # 但不应为了渲染而篡改self.truncated/self.terminated状态。
+        if self.terminated or self.truncated or force_speed_diagnostics:
             self._render_speed_diagnostics()
 
         self.fig.canvas.draw_idle()
@@ -2539,7 +2716,7 @@ class MillingEnvNurbs(gym.Env):
 
 if __name__ == "__main__":
     TEST_RANDOM_SEED = None
-    TEST_STEPS = 200
+    TEST_STEPS = 20000
     SHOW_FINAL_RENDER = True
     BLOCK_FINAL_FIGURE = True
 
@@ -2552,9 +2729,15 @@ if __name__ == "__main__":
     print(f"observation keys: {list(obs.keys())}, state shape: {obs['state'].shape}, "
           f"coverage shape: {obs['coverage'].shape}, action space: {env.action_space}")
 
-    for i in range(min(TEST_STEPS, env.max_generation_steps)):
+    for i in range(min(TEST_STEPS, env.max_episode_actions)):
         action = rng.uniform(-1.0, 1.0, size=2).astype(np.float32)
         obs, reward, terminated, truncated, info = env.step(action)
+        print("terminated:", terminated)
+        print("truncated:", truncated)
+        print("reason:", info["reason"])
+        print("invalid_action_steps:", info["invalid_action_steps"])
+        print("episode_action_count:", env.episode_action_count)
+        print("max_episode_actions:", env.max_episode_actions)
         if i % 5 == 0 or terminated or truncated:
             print(f"step {i + 1:03d} | reward {reward:8.3f} | new {info.get('new_cells', 0):4d} | "
                   f"coverage {info.get('coverage_ratio', 0.0) * 100:7.3f}% | "
@@ -2579,8 +2762,8 @@ if __name__ == "__main__":
         # 测试结束后再渲染最终路径和完整速度诊断图。
         env.render_mode = "plot"
         if not (env.terminated or env.truncated):
-            env.truncated = True
-        env.render()
+            print("测试循环达到TEST_STEPS上限，但环境仍未terminated/truncated；这不是环境截断。")
+        env.render(force_speed_diagnostics=True)
 
         if BLOCK_FINAL_FIGURE:
             print("最终render窗口已打开。关闭图窗后脚本才会退出。")
