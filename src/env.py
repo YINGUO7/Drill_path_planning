@@ -37,7 +37,7 @@ class MillingEnvNurbs(gym.Env):
     def __init__(self, wp_size_m=210e-3, pocket_side_m=190e-3, corner_radius_m=10e-3,
                  tool_dia_m=16e-3, v_max=0.10, acc_max=0.72, jerk_max=1.44,
                  resolution_m=0.5e-3, stepover_ratio=0.99, start_radius_ratio=0.90,
-                 coverage_target=0.9900, max_internal_turns=12, render_mode="plot",
+                 coverage_target=0.9998, max_internal_turns=12, render_mode="plot",
                  curve_sample_count=900, generation_points_per_turn=24,
                  curve_sample_spacing_m=0.5e-3, generation_time_window_points=240,
                  observation_grid_size=64,
@@ -46,7 +46,7 @@ class MillingEnvNurbs(gym.Env):
                  invalid_action_penalty=-8.0, use_local_step_sweep=True,
                  local_sweep_tail_points=None, max_consecutive_invalid_actions=500,
                  max_episode_actions=None,
-                 radial_gap_safety_ratio=None, radial_gap_bin_count=180,
+                 radial_gap_safety_ratio=None, radial_gap_bin_count=90,
                  radial_gap_violation_penalty=None,
                  local_time_planner="fast", local_fast_jerk_factor=0.8,
                  full_time_reward_weight=50.0, full_time_reference=120.0,
@@ -2720,9 +2720,9 @@ if __name__ == "__main__":
     SHOW_FINAL_RENDER = True
     BLOCK_FINAL_FIGURE = True
 
-    env = MillingEnvNurbs(render_mode=None, generation_points_per_turn=24,
+    env = MillingEnvNurbs(render_mode="plot", generation_points_per_turn=24,
                           generation_time_window_points=240,
-                          profile_step=True, profile_interval=10)
+                          profile_step=False, profile_interval=10)
     rng = np.random.default_rng(TEST_RANDOM_SEED)
     obs, _ = env.reset(seed=TEST_RANDOM_SEED)
     print("开始测试Env7：每个step新增一个控制点，并重建完整NURBS/B-spline曲线。")
