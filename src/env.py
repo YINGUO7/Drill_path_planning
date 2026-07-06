@@ -38,15 +38,15 @@ class MillingEnvNurbs(gym.Env):
                  tool_dia_m=16e-3, v_max=0.10, acc_max=0.72, jerk_max=1.44,
                  resolution_m=0.5e-3, stepover_ratio=0.99, start_radius_ratio=0.90,
                  coverage_target=0.9998, max_internal_turns=12, render_mode="plot",
-                 curve_sample_count=900, generation_points_per_turn=24,
+                 curve_sample_count=900, generation_points_per_turn=48,
                  curve_sample_spacing_m=0.5e-3, generation_time_window_points=240,
                  observation_grid_size=64,
                  time_eval_mode="local", coverage_efficiency_weight=0.01,
                  envelope_uncovered_weight=0.005, coverage_completion_bonus=200.0, remaining_cell_penalty=0.02,
                  invalid_action_penalty=-8.0, use_local_step_sweep=True,
-                 local_sweep_tail_points=None, max_consecutive_invalid_actions=500,
+                 local_sweep_tail_points=None, max_consecutive_invalid_actions=1000,
                  max_episode_actions=None,
-                 radial_gap_safety_ratio=None, radial_gap_bin_count=90,
+                 radial_gap_safety_ratio=None, radial_gap_bin_count=75,
                  radial_gap_violation_penalty=None,
                  local_time_planner="fast", local_fast_jerk_factor=0.8,
                  full_time_reward_weight=50.0, full_time_reference=120.0,
@@ -443,7 +443,7 @@ class MillingEnvNurbs(gym.Env):
         feasible_points = self.grid_points_flat[self.tool_center_feasible_mask.ravel()]
         self.generation_radius_limit = float(np.max(np.linalg.norm(feasible_points - self.path_center, axis=1)))
         self._precompute_boundary_radius()
-        self.max_generation_steps = int(np.ceil(1.35 * self.max_internal_turns * self.generation_points_per_turn))
+        self.max_generation_steps = int(np.ceil(2.50 * self.max_internal_turns * self.generation_points_per_turn))
         if self.requested_max_episode_actions is None:
             self.max_episode_actions = int(np.ceil(2 * self.max_generation_steps))
         else:
@@ -497,6 +497,7 @@ class MillingEnvNurbs(gym.Env):
         radius = np.array([self._ray_boundary_radius(t) for t in theta], dtype=np.float64)
         self.boundary_theta = np.concatenate((theta, [np.pi]))
         self.boundary_radius = np.concatenate((radius, [radius[0]]))
+        self._precompute_corner_theta_from_boundary(theta, radius)
         vectors = self.grid_points_flat - self.path_center
         grid_radius = np.linalg.norm(vectors, axis=1)
         grid_theta = np.arctan2(vectors[:, 1], vectors[:, 0])
@@ -504,6 +505,59 @@ class MillingEnvNurbs(gym.Env):
         self.grid_theta_flat = grid_theta
         self.grid_radius_flat = grid_radius
         self.grid_rho_flat = grid_radius / np.maximum(grid_boundary_radius, 1e-12)
+
+    def _precompute_corner_theta_from_boundary(self, theta, radius):
+        """从边界半径表中提取三角型腔的拐角方向。
+
+        输入：
+            theta: 周期角度采样，不包含末尾重复点。
+            radius: 对应角度方向上的可行边界半径。
+
+        输出：
+            无返回；写入 self.corner_theta。
+
+        说明：
+            在中心极坐标中，圆角三角型腔的三个顶点方向通常对应
+            r_boundary(theta) 的三个局部峰值。方案3只需要知道这些
+            方向，用于在拐角附近减小dtheta、增加控制点密度。
+        """
+        theta = np.asarray(theta, dtype=np.float64)
+        radius = np.asarray(radius, dtype=np.float64)
+        if len(theta) < 12:
+            self.corner_theta = np.array([], dtype=np.float64)
+            return
+
+        left = np.roll(radius, 1)
+        right = np.roll(radius, -1)
+        peak_idx = np.flatnonzero((radius >= left) & (radius >= right))
+        if len(peak_idx) == 0:
+            peak_idx = np.argsort(radius)[-3:]
+
+        # 先按半径从大到小取候选，再用最小角距避免同一个圆角峰附近重复取点。
+        order = peak_idx[np.argsort(radius[peak_idx])[::-1]]
+        min_sep = 2.0 * np.pi / 6.0
+        selected = []
+        for idx in order:
+            angle = float(theta[idx])
+            if all(self._angle_abs_diff(angle, old) >= min_sep for old in selected):
+                selected.append(angle)
+            if len(selected) >= 3:
+                break
+
+        if len(selected) < 3:
+            for idx in np.argsort(radius)[::-1]:
+                angle = float(theta[idx])
+                if all(self._angle_abs_diff(angle, old) >= min_sep for old in selected):
+                    selected.append(angle)
+                if len(selected) >= 3:
+                    break
+
+        self.corner_theta = np.asarray(selected, dtype=np.float64)
+
+    @staticmethod
+    def _angle_abs_diff(a, b):
+        """计算两个角度之间的最小绝对差，范围[0, pi]。"""
+        return float(abs((float(a) - float(b) + np.pi) % (2.0 * np.pi) - np.pi))
 
     def _boundary_radius(self, theta):
         """查询任意角度方向上的刀具中心可行边界半径。
@@ -687,6 +741,31 @@ class MillingEnvNurbs(gym.Env):
         dtheta = self.target_control_spacing / radius
         return float(np.clip(dtheta, self.min_dtheta, self.max_dtheta))
 
+    def _corner_dtheta_scale(self, theta):
+        """计算拐角区域的角度步长缩放系数。
+
+        输入：
+            theta: 当前控制点极角，单位rad。
+
+        输出：
+            scale: dtheta缩放系数。远离拐角约为1，靠近拐角小于1。
+
+        说明：
+            方案3的目标是在拐角附近增加控制点密度。这里不改变
+            self.base_dtheta、self.min_dtheta、self.max_dtheta 等初始化参数，
+            只在运行时根据当前角度对 dtheta_center 做局部缩小。
+        """
+        corners = getattr(self, "corner_theta", np.array([], dtype=np.float64))
+        if len(corners) == 0:
+            return 1.0
+
+        nearest = min(self._angle_abs_diff(theta, corner) for corner in corners)
+        # 影响宽度约为25度；中心处最多把dtheta压到55%。
+        width = np.deg2rad(25.0)
+        strength = 0.45
+        score = np.exp(-0.5 * (nearest / max(width, 1e-12)) ** 2)
+        return float(np.clip(1.0 - strength * score, 0.55, 1.0))
+
     def _action_intervals(self):
         """获取当前动作映射区间。
 
@@ -696,11 +775,18 @@ class MillingEnvNurbs(gym.Env):
         输出：
             dtheta_center, dtheta_lower, dtheta_upper, dr_lower, dr_upper: 当前动作映射中心和边界。
         """
-        recovery_gain = min(2.5, 1.0 + 0.35 * self.invalid_action_steps)
-        dtheta_center = self._base_dtheta_for_radius(self.current_radius)
-        dtheta_lower = max(0.25 * self.base_dtheta,
-                           dtheta_center - recovery_gain * (dtheta_center - self.min_dtheta))
-        dtheta_upper = dtheta_center + recovery_gain * (self.max_dtheta - dtheta_center)
+        recovery_gain = min(5.0, 1.0 + 0.35 * self.invalid_action_steps)
+        base_dtheta_center = self._base_dtheta_for_radius(self.current_radius)
+        base_dtheta_lower = max(0.25 * self.base_dtheta,
+                                base_dtheta_center - recovery_gain * (base_dtheta_center - self.min_dtheta))
+        base_dtheta_upper = base_dtheta_center + recovery_gain * (self.max_dtheta - base_dtheta_center)
+        corner_scale = self._corner_dtheta_scale(self.current_theta)
+        dtheta_center = float(np.clip(base_dtheta_center * corner_scale,
+                                      0.25 * self.base_dtheta, self.max_dtheta))
+        dtheta_lower = float(np.clip(base_dtheta_lower * corner_scale,
+                                     0.25 * self.base_dtheta, dtheta_center))
+        dtheta_upper = float(np.clip(base_dtheta_upper * corner_scale,
+                                     dtheta_center, self.max_dtheta))
         dr_lower = self.base_radial_step - recovery_gain * (self.base_radial_step - self.min_radial_step)
         dr_upper = self.base_radial_step + recovery_gain * (self.max_radial_step - self.base_radial_step)
         return dtheta_center, dtheta_lower, dtheta_upper, dr_lower, dr_upper
@@ -2134,7 +2220,7 @@ class MillingEnvNurbs(gym.Env):
         self.terminated = coverage_reached
         valid_step_truncated = self.current_step >= self.max_generation_steps
         action_count_truncated = self.episode_action_count >= self.max_episode_actions
-        no_new_cut_truncated = self.no_new_cut_steps >= 12
+        no_new_cut_truncated = self.no_new_cut_steps >= 50
         self.truncated = valid_step_truncated or action_count_truncated or no_new_cut_truncated
         truncation_reason = ""
         if valid_step_truncated:
