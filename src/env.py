@@ -222,6 +222,42 @@ class MillingEnvNurbs(gym.Env):
         if self.full_time_reward_floor > 0.0:
             raise ValueError("full_time_reward_floor必须小于或等于0。")
 
+    def _init_generation_parameters(self):
+        """初始化控制点生成参数。
+
+        输入：
+            使用刀具半径、stepover_ratio、generation_points_per_turn、max_internal_turns。
+
+        输出：
+            self.base_stepover: 基准刀间距。
+            self.base_radial_step: 每个控制点的基准半径增量。
+            self.min_radial_step / self.max_radial_step: 动作允许的有符号半径增量范围。
+            self.base_dtheta: 参考角度增量。
+            self.target_control_spacing: 控制点之间期望的近似空间步长。
+            self.generation_radius_limit: 控制点最大半径。
+            self.generation_radius_floor: 控制点最小半径。
+            self.max_generation_steps: 最大step数量。
+        """
+        self.base_stepover = self.stepover_ratio * 2.0 * self.tool_r
+        self.base_dtheta = 2.0 * np.pi / self.generation_points_per_turn
+        self.min_dtheta = 0.65 * self.base_dtheta
+        self.max_dtheta = 1.45 * self.base_dtheta
+        self.target_control_spacing = self.base_stepover
+        self.base_radial_step = self.base_stepover / self.generation_points_per_turn
+        # 半径动作范围应围绕“单个控制点的基准半径增量”设置，而不是围绕整圈刀间距设置。
+        # 这样动作尺度与generation_points_per_turn一致：每个step只调整当前控制点的局部径向推进。
+        self.min_radial_step = -2.0 * self.base_radial_step
+        self.max_radial_step = 6.0 * self.base_radial_step
+        self.generation_radius_floor = 0.70 * self.actual_start_radius
+        feasible_points = self.grid_points_flat[self.tool_center_feasible_mask.ravel()]
+        self.generation_radius_limit = float(np.max(np.linalg.norm(feasible_points - self.path_center, axis=1)))
+        self._precompute_boundary_radius()
+        self.max_generation_steps = int(np.ceil(2.50 * self.max_internal_turns * self.generation_points_per_turn))
+        if self.requested_max_episode_actions is None:
+            self.max_episode_actions = int(np.ceil(2 * self.max_generation_steps))
+        else:
+            self.max_episode_actions = max(1, int(self.requested_max_episode_actions))
+
     def _precompute_tool_disk_offsets(self):
         """预计算刀具圆盘对应的栅格偏移。
 
@@ -417,42 +453,6 @@ class MillingEnvNurbs(gym.Env):
         col0 = max(0, int(cols.min()) - padding)
         col1 = min(self.wp_grid_points, int(cols.max()) + padding + 1)
         self.obs_roi = (row0, row1, col0, col1)
-
-    def _init_generation_parameters(self):
-        """初始化控制点生成参数。
-
-        输入：
-            使用刀具半径、stepover_ratio、generation_points_per_turn、max_internal_turns。
-
-        输出：
-            self.base_stepover: 基准刀间距。
-            self.base_radial_step: 每个控制点的基准半径增量。
-            self.min_radial_step / self.max_radial_step: 动作允许的有符号半径增量范围。
-            self.base_dtheta: 参考角度增量。
-            self.target_control_spacing: 控制点之间期望的近似空间步长。
-            self.generation_radius_limit: 控制点最大半径。
-            self.generation_radius_floor: 控制点最小半径。
-            self.max_generation_steps: 最大step数量。
-        """
-        self.base_stepover = self.stepover_ratio * 2.0 * self.tool_r
-        self.base_dtheta = 2.0 * np.pi / self.generation_points_per_turn
-        self.min_dtheta = 0.65 * self.base_dtheta
-        self.max_dtheta = 1.45 * self.base_dtheta
-        self.target_control_spacing = self.base_stepover
-        self.base_radial_step = self.base_stepover / self.generation_points_per_turn
-        # 半径动作范围应围绕“单个控制点的基准半径增量”设置，而不是围绕整圈刀间距设置。
-        # 这样动作尺度与generation_points_per_turn一致：每个step只调整当前控制点的局部径向推进。
-        self.min_radial_step = -2.0 * self.base_radial_step
-        self.max_radial_step = 6.0 * self.base_radial_step
-        self.generation_radius_floor = 0.70 * self.actual_start_radius
-        feasible_points = self.grid_points_flat[self.tool_center_feasible_mask.ravel()]
-        self.generation_radius_limit = float(np.max(np.linalg.norm(feasible_points - self.path_center, axis=1)))
-        self._precompute_boundary_radius()
-        self.max_generation_steps = int(np.ceil(2.50 * self.max_internal_turns * self.generation_points_per_turn))
-        if self.requested_max_episode_actions is None:
-            self.max_episode_actions = int(np.ceil(2 * self.max_generation_steps))
-        else:
-            self.max_episode_actions = max(1, int(self.requested_max_episode_actions))
 
     def _point_inside_workspace(self, point):
         """判断点是否位于计算区域内部。
@@ -1152,9 +1152,9 @@ class MillingEnvNurbs(gym.Env):
         dtheta, dr_requested, action = self._map_action_to_increments(action)
         theta_new = self.current_theta + dtheta
         boundary_new = self._boundary_radius(theta_new)
-        rho_floor = min(1.0, self.generation_radius_floor / max(boundary_new, 1e-12))
-        rho_unclipped = self.current_rho + dr_requested / max(boundary_new, 1e-12)
-        rho_new = float(np.clip(rho_unclipped, rho_floor, 1.0))
+        # rho_floor = min(1.0, self.generation_radius_floor / max(boundary_new, 1e-12))
+        rho_new = self.current_rho + dr_requested / max(boundary_new, 1e-12)
+        # rho_new = float(np.clip(rho_unclipped, rho_floor, 1.0))
         new_point, radius_new, boundary_new = self._normalized_polar_point(theta_new, rho_new)
         dr = radius_new - self.current_radius
         t_action = time.perf_counter()
