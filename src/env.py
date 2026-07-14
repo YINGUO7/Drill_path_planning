@@ -1446,6 +1446,36 @@ class MillingEnvNurbs(gym.Env):
             "total_time": float(time_axis[-1]) if len(time_axis) else 0.0,
         }
 
+    @staticmethod
+    def _integrate_speed_profile_time(s_profile, v_profile, speed_floor=1e-9):
+        """从连续弧长-速度曲线积分加工时间，避免几何采样点末端零速导致时间爆炸。
+
+        输入：
+            s_profile: 速度曲线弧长采样，单位m。
+            v_profile: 速度曲线速度采样，单位m/s。
+            speed_floor: 时间积分速度下限，只用于数值保护。
+
+        输出：
+            total_time: 积分得到的加工时间，单位s。
+        """
+        s_profile = np.asarray(s_profile, dtype=np.float64)
+        v_profile = np.asarray(v_profile, dtype=np.float64)
+        if len(s_profile) < 2 or len(v_profile) < 2:
+            return 0.0
+        order = np.argsort(s_profile)
+        s_profile = s_profile[order]
+        v_profile = v_profile[order]
+        s_unique, keep = np.unique(s_profile, return_index=True)
+        v_unique = v_profile[keep]
+        if len(s_unique) < 2:
+            return 0.0
+        ds = np.diff(s_unique)
+        v_mid = 0.5 * (v_unique[:-1] + v_unique[1:])
+        valid = ds > 1e-12
+        if not np.any(valid):
+            return 0.0
+        return float(np.sum(ds[valid] / np.maximum(v_mid[valid], float(speed_floor))))
+
     def _axis_checked_feedrate_profile(self, geom, mode, return_profile=False, max_iter=12):
         """执行VPOp风格的X/Y轴约束速度规划。
 
@@ -1534,7 +1564,14 @@ class MillingEnvNurbs(gym.Env):
                 geom, v_geom, s_profile, v_profile, node_v, cap=cap
             )
             converged = converged or scaled_ok
-        total_time = float(dyn["total_time"])
+        # 加工总时间应由连续弧长-速度曲线积分得到。
+        # 不再使用dyn["total_time"]作为full_time来源，因为v_geom在终点附近可能被插值成多个0速度点，
+        # 导致非零长度段除以接近0的速度，产生1e9量级的虚假加工时间。
+        if s_profile is not None and v_profile is not None and len(s_profile) >= 2 and len(v_profile) >= 2:
+            total_time = self._integrate_speed_profile_time(s_profile, v_profile, speed_floor=1e-9)
+            dyn["total_time"] = float(total_time)
+        else:
+            total_time = float(dyn["total_time"])
         if not return_profile:
             return total_time
 
